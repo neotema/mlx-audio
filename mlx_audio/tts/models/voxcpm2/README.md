@@ -28,6 +28,8 @@ result = next(model.generate(
 ))
 ```
 
+Six-dimension prompt design (gender, age, timbre, pace, mood, accent): see [Voice Design Guide](../../../../docs/models/tts/voxcpm2-voice-design.md).
+
 ## Voice Cloning
 
 Clone any voice from an audio sample:

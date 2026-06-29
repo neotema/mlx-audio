@@ -412,6 +412,8 @@ class Model(nn.Module):
         prompt_audio=None,
         inference_timesteps: int = 10,
         cfg_value: float = 2.0,
+        temperature: float = 1.0,
+        seed: int | None = None,
         streaming_prefix_len: int = 4,
         warmup_patches: int = 0,
         # CLI compatibility aliases
@@ -439,6 +441,9 @@ class Model(nn.Module):
             cfg_value = max(cfg_scale, 2.0)
         if ddpm_steps is not None:
             inference_timesteps = ddpm_steps
+
+        if seed is not None:
+            mx.random.seed(int(seed))
 
         # Voice design: prepend description as (instruct)text
         if instruct:
@@ -632,6 +637,7 @@ class Model(nn.Module):
                 patch_size=self.patch_size,
                 cond=cond_in,
                 cfg_value=cfg_value,
+                temperature=temperature,
             )
 
             pred_feat = pred_feat.transpose(0, 2, 1)  # (B, P, D)

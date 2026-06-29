@@ -825,6 +825,7 @@ class Model(nn.Module):
                     sample = self.model.generate_frame(
                         curr_tokens, curr_tokens_mask, curr_pos, sampler
                     )
+                    mx.eval(sample)
                     if mx.all(sample == 0):
                         break  # eos
 
@@ -845,6 +846,7 @@ class Model(nn.Module):
                         axis=1,
                     )
                     curr_pos = curr_pos[:, -1:] + 1
+                    mx.eval(curr_tokens, curr_tokens_mask, curr_pos)
                     generated_frame_count += 1
                     pbar.update()
 

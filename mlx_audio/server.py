@@ -164,10 +164,18 @@ app.router.lifespan_context = app_lifespan
 
 
 # Request schemas for OpenAI-compatible endpoints
+class VoxCPMOptions(BaseModel):
+    cfg_value: float | None = None
+    inference_timesteps: int | None = None
+    temperature: float | None = None
+    seed: int | None = None
+
+
 class SpeechRequest(BaseModel):
     model: str
     input: str
     instruct: str | None = None
+    instructions: str | None = None
     voice: str | None = None
     speed: float | None = 1.0
     gender: str | None = "male"
@@ -175,6 +183,13 @@ class SpeechRequest(BaseModel):
     lang_code: str | None = "a"
     ref_audio: str | None = None
     ref_text: str | None = None
+    prompt_text: str | None = None
+    prompt_audio: str | None = None
+    inference_timesteps: int | None = None
+    cfg_value: float | None = None
+    warmup_patches: int | None = None
+    seed: int | None = None
+    voxcpm: VoxCPMOptions | None = None
     temperature: float | None = 0.7
     top_p: float | None = 0.95
     top_k: int | None = 40
@@ -240,29 +255,264 @@ def _load_model_for_inference(model_name: str):
     return model_provider.load_model(model_name)
 
 
+class ModelLoadExecutionAdapter(BaseModelExecutionAdapter):
+    """Load models on the inference broker thread for MLX stream affinity."""
+
+    def run_serial(self, request: InferenceRequest) -> None:
+        _load_model_for_inference(request.model_name)
+        request.emit_done()
+
+
+def _normalize_tts_generate_kwargs(model, generate_kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Filter ``generate`` kwargs and map API fields to model-specific names."""
+    signature = inspect.signature(model.generate)
+    params = signature.parameters
+    accepts_var_keyword = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+    if (
+        "max_audio_length_ms" in params
+        and generate_kwargs.get("max_tokens") is not None
+        and "max_audio_length_ms" not in generate_kwargs
+    ):
+        generate_kwargs = {
+            **generate_kwargs,
+            "max_audio_length_ms": int(generate_kwargs["max_tokens"]) * 80,
+        }
+
+    filtered: dict[str, Any] = {}
+    for key, value in generate_kwargs.items():
+        if key == "max_tokens" and key not in params:
+            continue
+        if value is None:
+            continue
+        if key in params or accepts_var_keyword:
+            filtered[key] = value
+    return filtered
+
+
+_AUDIO_FILE_SUFFIXES = (".wav", ".mp3", ".flac", ".ogg", ".opus", ".m4a", ".aac")
+
+
+def _speech_request_instruct(speech_request: SpeechRequest) -> str | None:
+    return speech_request.instruct or speech_request.instructions
+
+
+def _looks_like_base64_audio(value: str) -> bool:
+    if len(value) < 64:
+        return False
+    if value.startswith("data:"):
+        return True
+    if any(value.endswith(ext) for ext in _AUDIO_FILE_SUFFIXES):
+        return False
+    try:
+        base64.b64decode(value, validate=True)
+        return True
+    except Exception:
+        return False
+
+
+def _load_inline_audio(value: str) -> tuple[np.ndarray, int]:
+    if value.startswith("data:"):
+        _, _, encoded = value.partition(",")
+        if not encoded:
+            raise ValueError("Invalid data URL: missing payload")
+        raw = base64.b64decode(encoded)
+    else:
+        raw = base64.b64decode(value)
+    buffer = io.BytesIO(raw)
+    samples, sample_rate = audio_read(buffer)
+    if len(samples.shape) > 1:
+        samples = samples.mean(axis=1)
+    return samples.astype(np.float32), sample_rate
+
+
+def _resolve_tts_audio_input(
+    value: str | None,
+    *,
+    model,
+    field_name: str,
+) -> Any:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return value
+
+    if value.startswith("data:") or (
+        not os.path.exists(value) and _looks_like_base64_audio(value)
+    ):
+        try:
+            samples, orig_sample_rate = _load_inline_audio(value)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to decode {field_name}: {exc}",
+            ) from exc
+
+        from mlx_audio.utils import resample_audio
+
+        target_sample_rate = getattr(model, "sample_rate", 24000)
+        if orig_sample_rate != target_sample_rate:
+            samples = resample_audio(samples, orig_sample_rate, target_sample_rate)
+        return mx.array(samples)
+
+    if not os.path.exists(value):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} file not found: {value}",
+        )
+
+    from mlx_audio.tts.generate import load_audio
+
+    normalize = hasattr(model, "model_type") and model.model_type == "spark"
+    return load_audio(
+        value,
+        sample_rate=model.sample_rate,
+        volume_normalize=normalize,
+    )
+
+
+def _validate_speech_request(payload: SpeechRequest) -> None:
+    has_prompt_text = bool(payload.prompt_text)
+    has_prompt_audio = bool(payload.prompt_audio)
+    if has_prompt_text != has_prompt_audio:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "prompt_text and prompt_audio must both be set for continuation mode"
+            ),
+        )
+
+
+def _is_voxcpm2_model(model) -> bool:
+    return "voxcpm2" in type(model).__module__
+
+
+def _resolve_voxcpm_params(speech_request: SpeechRequest) -> dict[str, Any]:
+    """Resolve VoxCPM2 knobs with top-level fields taking precedence over ``voxcpm``."""
+    voxcpm = speech_request.voxcpm
+    fields_set = speech_request.model_fields_set
+    nested = voxcpm.model_fields_set if voxcpm else set()
+
+    def pick(top_key: str, nested_value):
+        if top_key in fields_set and getattr(speech_request, top_key) is not None:
+            return getattr(speech_request, top_key)
+        if nested_value is not None:
+            return nested_value
+        return None
+
+    return {
+        "seed": pick("seed", voxcpm.seed if voxcpm else None),
+        "temperature": pick(
+            "temperature",
+            voxcpm.temperature if voxcpm and "temperature" in nested else None,
+        ),
+        "cfg_value": pick(
+            "cfg_value",
+            voxcpm.cfg_value if voxcpm and "cfg_value" in nested else None,
+        ),
+        "inference_timesteps": pick(
+            "inference_timesteps",
+            voxcpm.inference_timesteps
+            if voxcpm and "inference_timesteps" in nested
+            else None,
+        ),
+    }
+
+
+def _seed_mlx_rng(seed: int | None, *, sequence_index: int = 0) -> None:
+    if seed is not None:
+        mx.random.seed(int(seed) + sequence_index)
+
+
+def _build_tts_generate_kwargs(model, speech_request: SpeechRequest) -> dict[str, Any]:
+    voxcpm_params = _resolve_voxcpm_params(speech_request)
+    if _is_voxcpm2_model(model):
+        temperature = voxcpm_params.get("temperature")
+    else:
+        temperature = speech_request.temperature
+
+    return _normalize_tts_generate_kwargs(
+        model,
+        {
+            "voice": speech_request.voice,
+            "speed": speech_request.speed,
+            "gender": speech_request.gender,
+            "pitch": speech_request.pitch,
+            "instruct": _speech_request_instruct(speech_request),
+            "lang_code": speech_request.lang_code,
+            "ref_audio": _resolve_tts_audio_input(
+                speech_request.ref_audio,
+                model=model,
+                field_name="ref_audio",
+            ),
+            "ref_text": speech_request.ref_text,
+            "prompt_text": speech_request.prompt_text,
+            "prompt_audio": _resolve_tts_audio_input(
+                speech_request.prompt_audio,
+                model=model,
+                field_name="prompt_audio",
+            ),
+            "inference_timesteps": voxcpm_params.get("inference_timesteps"),
+            "cfg_value": voxcpm_params.get("cfg_value"),
+            "warmup_patches": speech_request.warmup_patches,
+            "temperature": temperature,
+            "seed": voxcpm_params.get("seed"),
+            "top_p": speech_request.top_p,
+            "top_k": speech_request.top_k,
+            "repetition_penalty": speech_request.repetition_penalty,
+            "stream": speech_request.stream,
+            "streaming_interval": speech_request.streaming_interval,
+            "max_tokens": speech_request.max_tokens,
+            "verbose": speech_request.verbose,
+        },
+    )
+
+
+def _translate_model_load_error(model_name: str, exc: BaseException) -> HTTPException:
+    if isinstance(exc, HTTPException):
+        return exc
+    if isinstance(exc, RepositoryNotFoundError):
+        return HTTPException(
+            status_code=404,
+            detail=(
+                f"Model not found: {model_name!r} is not a known HuggingFace repo "
+                "or local path"
+            ),
+        )
+    return HTTPException(
+        status_code=500,
+        detail=f"Failed to load model {model_name!r}: {exc}",
+    )
+
+
 async def _preflight_model_load(model_name: str) -> None:
-    """Load ``model_name`` synchronously and translate failures into HTTPException.
+    """Load ``model_name`` on the inference broker thread.
 
     Routes that return a ``StreamingResponse`` commit the HTTP status + headers
     before the body generator runs, so any failure inside the inference worker
     surfaces as 200 OK with an empty body. Pre-flighting the load here lets the
     framework's exception handlers turn the failure into a real HTTP error
     response. Warm models are a no-op (``ModelProvider.load_model`` is cached).
+
+    MLX GPU streams are thread-local, so the load must happen on the same worker
+    thread that later runs ``model.generate()``.
     """
+    handle = get_inference_broker().submit(
+        endpoint_kind="load",
+        model_name=model_name,
+        payload=None,
+    )
     try:
-        await asyncio.to_thread(_load_model_for_inference, model_name)
-    except HTTPException:
-        raise
-    except RepositoryNotFoundError as exc:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Model not found: {model_name!r} is not a known HuggingFace repo or local path",
-        ) from exc
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to load model {model_name!r}: {exc}",
-        ) from exc
+        while True:
+            chunk = await _next_inference_chunk(handle)
+            if chunk.kind == "done":
+                return
+            if chunk.kind == "error":
+                raise _translate_model_load_error(model_name, chunk.error)
+    finally:
+        handle.cancel()
 
 
 _STT_EXTRA_KWARGS = {"word_timestamps", "timestamp_granularities"}
@@ -486,6 +736,14 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
             return False
         if speech_request.ref_audio or speech_request.ref_text:
             return False
+        if speech_request.prompt_text or speech_request.prompt_audio:
+            return False
+        if speech_request.inference_timesteps is not None:
+            return False
+        if speech_request.cfg_value is not None:
+            return False
+        if speech_request.warmup_patches is not None:
+            return False
         if speech_request.gender not in (None, "male"):
             return False
         if speech_request.speed not in (None, 1.0):
@@ -555,6 +813,12 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
             speech_request.max_tokens,
             speech_request.ref_audio,
             speech_request.ref_text,
+            speech_request.prompt_text,
+            speech_request.prompt_audio,
+            speech_request.inference_timesteps,
+            speech_request.cfg_value,
+            speech_request.warmup_patches,
+            _speech_request_instruct(speech_request),
             speech_request.streaming_interval if speech_request.stream else None,
             speech_request.verbose,
         )
@@ -592,48 +856,17 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
         )
         request.emit_data(buffer.getvalue())
 
-    def run_serial(self, request: InferenceRequest) -> None:
+    def run_serial(
+        self, request: InferenceRequest, *, sequence_index: int = 0
+    ) -> None:
         payload: SpeechTaskPayload = request.payload
         speech_request = payload.request
         model = self._get_model_for_request(request)
 
-        ref_audio = speech_request.ref_audio
-        if ref_audio and isinstance(ref_audio, str):
-            if not os.path.exists(ref_audio):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Reference audio file not found: {ref_audio}",
-                )
-
-            from mlx_audio.tts.generate import load_audio
-
-            normalize = hasattr(model, "model_type") and model.model_type == "spark"
-            ref_audio = load_audio(
-                ref_audio,
-                sample_rate=model.sample_rate,
-                volume_normalize=normalize,
-            )
-
         audio_chunks = []
         sample_rate = None
-        generate_kwargs = {
-            "voice": speech_request.voice,
-            "speed": speech_request.speed,
-            "gender": speech_request.gender,
-            "pitch": speech_request.pitch,
-            "instruct": speech_request.instruct,
-            "lang_code": speech_request.lang_code,
-            "ref_audio": ref_audio,
-            "ref_text": speech_request.ref_text,
-            "temperature": speech_request.temperature,
-            "top_p": speech_request.top_p,
-            "top_k": speech_request.top_k,
-            "repetition_penalty": speech_request.repetition_penalty,
-            "stream": speech_request.stream,
-            "streaming_interval": speech_request.streaming_interval,
-            "max_tokens": speech_request.max_tokens,
-            "verbose": speech_request.verbose,
-        }
+        generate_kwargs = _build_tts_generate_kwargs(model, speech_request)
+        _seed_mlx_rng(generate_kwargs.get("seed"), sequence_index=sequence_index)
 
         for result in model.generate(speech_request.input, **generate_kwargs):
             if request.cancel_event.is_set():
@@ -673,8 +906,8 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
         if not all(
             self._can_call_batch_generate(model, request) for request in requests
         ):
-            for request in requests:
-                self.run_serial(request)
+            for sequence_idx, request in enumerate(requests):
+                self.run_serial(request, sequence_index=sequence_idx)
             return
 
         first_speech_request: SpeechRequest = requests[0].payload.request
@@ -689,8 +922,8 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
 
         batch_generate = self._get_callable_model_attr(model, "batch_generate")
         if batch_generate is None:
-            for request in requests:
-                self.run_serial(request)
+            for sequence_idx, request in enumerate(requests):
+                self.run_serial(request, sequence_index=sequence_idx)
             return
 
         signature = inspect.signature(batch_generate)
@@ -824,6 +1057,7 @@ def get_inference_broker() -> InferenceBroker:
     global INFERENCE_BROKER
     if INFERENCE_BROKER is None:
         broker = InferenceBroker()
+        broker.register_adapter("load", ModelLoadExecutionAdapter())
         broker.register_adapter("stt", STTExecutionAdapter())
         broker.register_adapter("tts", TTSExecutionAdapter())
         broker.register_adapter("separation", SeparationExecutionAdapter())
@@ -932,12 +1166,7 @@ async def remove_model(model_name: str):
 @app.post("/v1/audio/speech")
 async def tts_speech(payload: SpeechRequest, request: Request):
     """Generate speech audio following the OpenAI text-to-speech API."""
-    if payload.ref_audio and isinstance(payload.ref_audio, str):
-        if not os.path.exists(payload.ref_audio):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Reference audio file not found: {payload.ref_audio}",
-            )
+    _validate_speech_request(payload)
 
     await _preflight_model_load(payload.model)
 
